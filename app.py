@@ -70,7 +70,6 @@ if boundary_mode != "Sử dụng chu vi bề mặt làm ranh giới":
     boundary_file = st.sidebar.file_uploader("Tải lên file ranh giới", type=["txt", "dxf"], key="boundary_file_upload")
 
 grid_size = st.sidebar.number_input("Kích thước cạnh ô lưới vuông (m)", min_value=1.0, value=5.0, step=1.0)
-
 # --- HÀM PARSER ĐỌC FILE TXT ---
 def load_real_points(surface_dict):
     if surface_dict["type"] == "const" or surface_dict["value"] is None:
@@ -89,12 +88,15 @@ def load_real_points(surface_dict):
     except:
         return None
     return np.array(points) if len(points) > 0 else None
+
+# --- THUẬT TOÁN XỬ LÝ RANH GIỚI KHÉP KÍN KHÔNG LỖI NET ĐAN CHÉO ---
 def parse_boundary(mode, sub_mode, file_obj, pts1, pts2):
     if mode == "Sử dụng chu vi bề mặt làm ranh giới":
         if sub_mode == "Sử dụng chu vi bề mặt 2":
             if pts2 is None: return None, "surface2"
             hull2 = ConvexHull(pts2[:, :2])
-            return Polygon(pts2[hull2.vertices, :2]), "surface2"
+            vertices = pts2[hull2.vertices, :2]
+            return Polygon(vertices), "surface2"
         elif sub_mode == "Sử dụng chu vi từng bề mặt (Vùng giao nhau)":
             if pts1 is None or pts2 is None: return None, "surfaces_intersect"
             hull1 = ConvexHull(pts1[:, :2])
@@ -106,7 +108,9 @@ def parse_boundary(mode, sub_mode, file_obj, pts1, pts2):
                 if isinstance(intersect_poly, Polygon):
                     return intersect_poly, "surfaces_intersect"
             return None, "surfaces_intersect"
+            
     if file_obj is None: return None, "custom"
+    
     if "TXT" in mode:
         coords = []
         try:
@@ -121,6 +125,7 @@ def parse_boundary(mode, sub_mode, file_obj, pts1, pts2):
                     coords.append((float(parts[0]), float(parts[1])))
             return Polygon(coords) if len(coords) >= 3 else None, "custom"
         except: return None, "custom"
+        
     if "DXF" in mode:
         try:
             dxf_data_bytes = file_obj.read()
@@ -134,18 +139,20 @@ def parse_boundary(mode, sub_mode, file_obj, pts1, pts2):
                     return Polygon(coords), "custom"
         except: return None, "custom"
     return None, "custom"
-
+# --- XỬ LÝ TÍNH TOÁN KHI NHẤN NÚT ---
 if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
     pts1 = load_real_points(surface_1)
     pts2 = load_real_points(surface_2)
     st.session_state.pts1_real = pts1
     st.session_state.pts2_real = pts2
     
+    # Tạo chu vi khép kín thực tế cho Bề mặt 1 bằng cách lặp lại điểm đầu ở cuối mảng
     if pts1 is not None and len(pts1) >= 3:
         try:
             hull1_geom = ConvexHull(pts1[:, :2])
-            poly1_hull = Polygon(pts1[hull1_geom.vertices, :2])
-            st.session_state.s1_hull_coords = list(poly1_hull.exterior.coords)
+            ordered_vertices = pts1[hull1_geom.vertices, :2]
+            closed_vertices = np.vstack([ordered_vertices, ordered_vertices[0]])
+            st.session_state.s1_hull_coords = [tuple(p) for p in closed_vertices]
         except:
             st.session_state.s1_hull_coords = None
     else:
@@ -166,9 +173,12 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
         valid = False
         
     if valid:
-        st.session_state.boundary_poly_coords = list(boundary_polygon.exterior.coords)
-        x_min, y_min, x_max, y_max = boundary_polygon.bounds
+        raw_coords = list(boundary_polygon.exterior.coords)
+        if raw_coords[0] != raw_coords[-1]:
+            raw_coords.append(raw_coords[0])
+        st.session_state.boundary_poly_coords = raw_coords
         
+        x_min, y_min, x_max, y_max = boundary_polygon.bounds
         x_coords = np.arange(x_min, x_max + grid_size, grid_size)
         y_coords = np.arange(y_min, y_max + grid_size, grid_size)
         
@@ -217,7 +227,7 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
                 xv, yv = np.meshgrid(sub_x, sub_y)
                 sub_pts = np.vstack([xv.ravel(), yv.ravel()]).T
                 
-                # ĐÃ SỬA LỖI SHAPELY: Unpack mảng p thành hai tọa độ vô hướng p[0], p[1] để tạo Point
+                # SỬA LỖI SHAPELY SẢN XUẤT: Truyền trực tiếp tuple tọa độ từ mảng p vào Point
                 valid_sub_mask = np.array([boundary_polygon.contains(Point(p[0], p[1])) for p in sub_pts])
                 if not np.any(valid_sub_mask):
                     continue
@@ -245,7 +255,7 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
                 total_cut_vol += cell_cut
                 total_fill_vol += cell_fill
                 
-                # ĐÃ SỬA LỖI MẢNG NUMPY: Chỉ định rõ chỉ mục phần tử [0], [1], [2], [3] của 4 góc để xuất Excel độc lập
+                # SỬA LỖI NUMPY SẢN XUẤT: Bóc tách tường minh từng phần tử lẻ từ mảng corners vào Excel
                 raw_cell_records.append({
                     'row_idx': r_idx + 1,
                     'col_idx': c_idx + 1,
@@ -290,8 +300,9 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
             st.session_state.total_fill = total_fill_vol
             st.session_state.cad_grid_data = cad_cells
             st.session_state.calculated = True
+# --- HIỂN THỊ KẾT QUẢ VÙNG TRUNG TÂM ---
 if st.session_state.calculated and st.session_state.df_by_rows is not None:
-    st.success("🎉 Tính toán bảo toàn số liệu thành công! File Excel 12 cột và bản vẽ CAD đã sẵn sàng để tải xuống.")
+    st.success("🎉 Quy trình kiểm định thuật toán thành công! Dữ liệu 12 cột và bản vẽ CAD đã sẵn sàng.")
     
     col1, col2, col3 = st.columns(3)
     col1.metric("Tổng khối lượng ĐÀO 🟥", f"{st.session_state.total_cut:,.2f} m³")
@@ -305,7 +316,7 @@ if st.session_state.calculated and st.session_state.df_by_rows is not None:
     with tab2:
         st.dataframe(st.session_state.df_by_cols, use_container_width=True)
     
-    st.subheader("💾 Tải về tệp thành phẩm kỹ thuật")
+    st.subheader("💾 Tải về tệp báo cáo kỹ thuật công trường")
     dwn_col1, dwn_col2 = st.columns(2)
     
     output_excel = io.BytesIO()
