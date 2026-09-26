@@ -71,7 +71,7 @@ if boundary_mode != "Sử dụng chu vi bề mặt làm ranh giới":
 
 grid_size = st.sidebar.number_input("Kích thước cạnh ô lưới vuông (m)", min_value=1.0, value=5.0, step=1.0)
 
-# --- CÁC HÀM PARSER ĐỌC DỮ LIỆU THỰC TẾ ---
+# --- HÀM PARSER ĐỌC FILE TXT ---
 def load_real_points(surface_dict):
     if surface_dict["type"] == "const" or surface_dict["value"] is None:
         return None
@@ -141,7 +141,6 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
     st.session_state.pts1_real = pts1
     st.session_state.pts2_real = pts2
     
-    # Tính và lưu trữ chu vi ngoài của riêng Bề mặt 1 bằng Convex Hull để vẽ CAD sau này
     if pts1 is not None and len(pts1) >= 3:
         try:
             hull1_geom = ConvexHull(pts1[:, :2])
@@ -218,7 +217,8 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
                 xv, yv = np.meshgrid(sub_x, sub_y)
                 sub_pts = np.vstack([xv.ravel(), yv.ravel()]).T
                 
-                valid_sub_mask = np.array([boundary_polygon.contains(Point(p, p)) for p in sub_pts])
+                # ĐÃ SỬA LỖI SHAPELY: Unpack mảng p thành hai tọa độ vô hướng p[0], p[1] để tạo Point
+                valid_sub_mask = np.array([boundary_polygon.contains(Point(p[0], p[1])) for p in sub_pts])
                 if not np.any(valid_sub_mask):
                     continue
                     
@@ -245,6 +245,7 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
                 total_cut_vol += cell_cut
                 total_fill_vol += cell_fill
                 
+                # ĐÃ SỬA LỖI MẢNG NUMPY: Chỉ định rõ chỉ mục phần tử [0], [1], [2], [3] của 4 góc để xuất Excel độc lập
                 raw_cell_records.append({
                     'row_idx': r_idx + 1,
                     'col_idx': c_idx + 1,
@@ -290,7 +291,7 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
             st.session_state.cad_grid_data = cad_cells
             st.session_state.calculated = True
 if st.session_state.calculated and st.session_state.df_by_rows is not None:
-    st.success("🎉 Tính toán thành công! Chu vi Bề mặt 1 và 2 cùng bản vẽ CAD đã được xuất lớp phân tầng.")
+    st.success("🎉 Tính toán bảo toàn số liệu thành công! File Excel 12 cột và bản vẽ CAD đã sẵn sàng để tải xuống.")
     
     col1, col2, col3 = st.columns(3)
     col1.metric("Tổng khối lượng ĐÀO 🟥", f"{st.session_state.total_cut:,.2f} m³")
@@ -304,7 +305,7 @@ if st.session_state.calculated and st.session_state.df_by_rows is not None:
     with tab2:
         st.dataframe(st.session_state.df_by_cols, use_container_width=True)
     
-    st.subheader("💾 Tải về tệp báo cáo công trường thành phẩm")
+    st.subheader("💾 Tải về tệp thành phẩm kỹ thuật")
     dwn_col1, dwn_col2 = st.columns(2)
     
     output_excel = io.BytesIO()
@@ -322,50 +323,37 @@ if st.session_state.calculated and st.session_state.df_by_rows is not None:
             use_container_width=True
         )
         
-    # --- KHỞI TẠO XUẤT CAD DXF CHUYÊN NGHIỆP ---
     doc = ezdxf.new('R2010')
     msp = doc.modelspace()
 
-    doc.layers.new(name='SURFACE_1', dxfattribs={'color': 1})    # Đỏ (Mặc định cho điểm trắc địa tự nhiên)
-    doc.layers.new(name='SURFACE_2', dxfattribs={'color': 3})    # Xanh lá (Mặc định cho điểm thiết kế)
+    doc.layers.new(name='SURFACE_1', dxfattribs={'color': 1})    
+    doc.layers.new(name='SURFACE_2', dxfattribs={'color': 3})    
     doc.layers.new(name='GRID_LINES', dxfattribs={'color': 7})   
     doc.layers.new(name='BOUNDARY_CUSTOM', dxfattribs={'color': 2}) 
     doc.layers.new(name='EARTHWORK_CUT', dxfattribs={'color': 1}) 
     doc.layers.new(name='EARTHWORK_FILL', dxfattribs={'color': 3})
 
-    # Vẽ các điểm của Bề mặt 1
     if st.session_state.pts1_real is not None:
         for pt in st.session_state.pts1_real:
             x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
             msp.add_point((x, y, z), dxfattribs={'layer': 'SURFACE_1'})
             msp.add_text(text=f"{z:.2f}", dxfattribs={'layer': 'SURFACE_1', 'height': 0.3}).set_placement((x + 0.2, y, z))
 
-    # ĐÃ CẬP NHẬT: Vẽ đường chu vi ngoài Bề mặt 1 vào cùng Layer SURFACE_1, đặt Màu Xanh Dương ('color': 5)
     if st.session_state.s1_hull_coords is not None:
-        msp.add_lwpolyline(
-            st.session_state.s1_hull_coords, 
-            dxfattribs={
-                'layer': 'SURFACE_1', 
-                'color': 5,            # Mã màu AutoCAD số 5 = Xanh Dương (Blue)
-                'const_width': 0.15
-            }
-        )
+        msp.add_lwpolyline(st.session_state.s1_hull_coords, dxfattribs={'layer': 'SURFACE_1', 'color': 5, 'const_width': 0.15})
 
-    # Vẽ các điểm của Bề mặt 2
     if st.session_state.pts2_real is not None:
         for pt in st.session_state.pts2_real:
             x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
             msp.add_point((x, y, z), dxfattribs={'layer': 'SURFACE_2'})
             msp.add_text(text=f"{z:.2f}", dxfattribs={'layer': 'SURFACE_2', 'height': 0.3}).set_placement((x + 0.2, y, z))
 
-    # Vẽ đường ranh giới tính toán (Chu vi bề mặt 2 màu vàng hoặc ranh giới ngoài màu vàng)
     if st.session_state.boundary_poly_coords is not None:
         if st.session_state.boundary_source in ["surface2", "surfaces_intersect"]:
             msp.add_lwpolyline(st.session_state.boundary_poly_coords, dxfattribs={'layer': 'SURFACE_2', 'color': 2, 'const_width': 0.15})
         else:
             msp.add_lwpolyline(st.session_state.boundary_poly_coords, dxfattribs={'layer': 'BOUNDARY_CUSTOM', 'const_width': 0.15})
 
-    # Vẽ hệ lưới ô vuông đã cắt tỉa
     for cell in st.session_state.cad_grid_data:
         for poly_line in cell['lines']:
             for i in range(len(poly_line) - 1):
