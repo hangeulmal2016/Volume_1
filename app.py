@@ -5,7 +5,7 @@ import ezdxf
 from ezdxf.enums import TextEntityAlignment
 from scipy.interpolate import griddata
 from scipy.spatial import ConvexHull
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import Polygon, MultiPolygon, Point
 import io
 
 st.set_page_config(page_title="Earthwork Grid Calculator", layout="wide")
@@ -14,8 +14,10 @@ st.title("🧮 Web App Tính Khối Lượng Đào Đắp Tùy Chọn Ranh Giớ
 # --- KHỞI TẠO TRẠNG THÁI LƯU TRỮ (SESSION STATE) ---
 if "calculated" not in st.session_state:
     st.session_state.calculated = False
-if "df_result" not in st.session_state:
-    st.session_state.df_result = None
+if "df_by_rows" not in st.session_state:
+    st.session_state.df_by_rows = None
+if "df_by_cols" not in st.session_state:
+    st.session_state.df_by_cols = None
 if "total_cut" not in st.session_state:
     st.session_state.total_cut = 0.0
 if "total_fill" not in st.session_state:
@@ -30,6 +32,8 @@ if "boundary_poly_coords" not in st.session_state:
     st.session_state.boundary_poly_coords = None
 if "boundary_source" not in st.session_state:
     st.session_state.boundary_source = "surface2"
+if "s1_hull_coords" not in st.session_state:
+    st.session_state.s1_hull_coords = None
 
 # --- GIAO DIỆN NHẬP LIỆU (SIDEBAR) ---
 st.sidebar.header("1. Cấu hình Dữ liệu Đầu vào")
@@ -91,7 +95,6 @@ def parse_boundary(mode, sub_mode, file_obj, pts1, pts2):
             if pts2 is None: return None, "surface2"
             hull2 = ConvexHull(pts2[:, :2])
             return Polygon(pts2[hull2.vertices, :2]), "surface2"
-        
         elif sub_mode == "Sử dụng chu vi từng bề mặt (Vùng giao nhau)":
             if pts1 is None or pts2 is None: return None, "surfaces_intersect"
             hull1 = ConvexHull(pts1[:, :2])
@@ -103,9 +106,7 @@ def parse_boundary(mode, sub_mode, file_obj, pts1, pts2):
                 if isinstance(intersect_poly, Polygon):
                     return intersect_poly, "surfaces_intersect"
             return None, "surfaces_intersect"
-        
     if file_obj is None: return None, "custom"
-    
     if "TXT" in mode:
         coords = []
         try:
@@ -119,32 +120,38 @@ def parse_boundary(mode, sub_mode, file_obj, pts1, pts2):
                 if len(parts) >= 2:
                     coords.append((float(parts[0]), float(parts[1])))
             return Polygon(coords) if len(coords) >= 3 else None, "custom"
-        except:
-            return None, "custom"
-        
+        except: return None, "custom"
     if "DXF" in mode:
         try:
-            dxf_stream = io.BytesIO(file_obj.read())
+            dxf_data_bytes = file_obj.read()
             file_obj.seek(0)
-            doc = ezdxf.read(dxf_stream)
+            text_stream = io.StringIO(dxf_data_bytes.decode('utf-8', errors='ignore'))
+            doc = ezdxf.read(text_stream)
             msp = doc.modelspace()
             for entity in msp.query('LWPOLYLINE POLYLINE'):
                 coords = [pt[:2] for pt in entity.points()]
                 if len(coords) >= 3:
                     return Polygon(coords), "custom"
-        except:
-            return None, "custom"
-            
+        except: return None, "custom"
     return None, "custom"
 
-# --- XỬ LÝ TÍNH TOÁN KHI NHẤN NÚT ---
 if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
     pts1 = load_real_points(surface_1)
     pts2 = load_real_points(surface_2)
-    
     st.session_state.pts1_real = pts1
     st.session_state.pts2_real = pts2
     
+    # Tính và lưu trữ chu vi ngoài của riêng Bề mặt 1 bằng Convex Hull để vẽ CAD sau này
+    if pts1 is not None and len(pts1) >= 3:
+        try:
+            hull1_geom = ConvexHull(pts1[:, :2])
+            poly1_hull = Polygon(pts1[hull1_geom.vertices, :2])
+            st.session_state.s1_hull_coords = list(poly1_hull.exterior.coords)
+        except:
+            st.session_state.s1_hull_coords = None
+    else:
+        st.session_state.s1_hull_coords = None
+        
     boundary_polygon, b_source = parse_boundary(boundary_mode, sub_boundary_mode, boundary_file, pts1, pts2)
     st.session_state.boundary_source = b_source
     
@@ -166,31 +173,38 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
         x_coords = np.arange(x_min, x_max + grid_size, grid_size)
         y_coords = np.arange(y_min, y_max + grid_size, grid_size)
         
-        grid_rows_list = []
+        raw_cell_records = []
         cad_cells = []
         total_cut_vol = 0.0
         total_fill_vol = 0.0
+        SUB_STEP = 0.5 
         
+        def get_vertex_z(pts_data, surface_cfg, corners_array):
+            if surface_cfg["type"] == "const":
+                return np.full(4, float(surface_cfg["value"]))
+            z = griddata(pts_data[:, :2], pts_data[:, 2], corners_array, method='linear')
+            nan_m = np.isnan(z)
+            if np.any(nan_m):
+                z[nan_m] = griddata(pts_data[:, :2], pts_data[:, 2], corners_array[nan_m], method='nearest')
+            return z.astype(float)
+
         for r_idx in range(len(y_coords) - 1):
-            row_cells_data = []
-            y_start = y_coords[r_idx]
-            y_end = y_coords[r_idx + 1]
-            
+            y_start, y_end = y_coords[r_idx], y_coords[r_idx + 1]
             for c_idx in range(len(x_coords) - 1):
-                x_start = x_coords[c_idx]
-                x_end = x_coords[c_idx + 1]
+                x_start, x_end = x_coords[c_idx], x_coords[c_idx + 1]
                 
-                cell_poly = Polygon([
-                    (x_start, y_start), (x_end, y_start),
-                    (x_end, y_end), (x_start, y_end)
-                ])
-                
+                cell_poly = Polygon([(x_start, y_start), (x_end, y_start), (x_end, y_end), (x_start, y_end)])
                 if not cell_poly.intersects(boundary_polygon):
-                    row_cells_data.append("Ngoài RG")
                     continue
                 
                 intersected_geo = cell_poly.intersection(boundary_polygon)
                 actual_area = intersected_geo.area
+                if actual_area < 0.001:
+                    continue
+                
+                corners = np.array([[x_start, y_start], [x_end, y_start], [x_end, y_end], [x_start, y_end]])
+                z1_corners = get_vertex_z(pts1, surface_1, corners)
+                z2_corners = get_vertex_z(pts2, surface_2, corners)
                 
                 grid_lines_to_draw = []
                 if isinstance(intersected_geo, Polygon):
@@ -199,58 +213,84 @@ if st.sidebar.button("👉 Tiến hành tính toán khối lượng"):
                     for poly in intersected_geo.geoms:
                         grid_lines_to_draw.append(list(poly.exterior.coords))
                 
-                cx, cy = intersected_geo.centroid.x, intersected_geo.centroid.y
-                corners_eval = np.array([[cx, cy]])
+                sub_x = np.arange(x_start + SUB_STEP/2, x_end, SUB_STEP)
+                sub_y = np.arange(y_start + SUB_STEP/2, y_end, SUB_STEP)
+                xv, yv = np.meshgrid(sub_x, sub_y)
+                sub_pts = np.vstack([xv.ravel(), yv.ravel()]).T
                 
-                def get_z_at_centroid(pts_data, surface_cfg):
-                    if surface_cfg["type"] == "const":
-                        return surface_cfg["value"]
-                    else:
-                        z_val = griddata(pts_data[:, :2], pts_data[:, 2], corners_eval, method='linear')
-                        if np.isnan(z_val):
-                            z_val = griddata(pts_data[:, :2], pts_data[:, 2], corners_eval, method='nearest')
-                        return float(z_val[0])
-                
-                z1_center = get_z_at_centroid(pts1, surface_1)
-                z2_center = get_z_at_centroid(pts2, surface_2)
-                
-                dz = z2_center - z1_center
-                volume = actual_area * dz
-                
-                if volume < 0:
-                    cut_v = abs(volume)
-                    fill_v = 0.0
-                    cell_str = f"Đào: {cut_v:.1f} m³"
-                else:
-                    cut_v = 0.0
-                    fill_v = volume
-                    cell_str = f"Đắp: {fill_v:.1f} m³"
+                valid_sub_mask = np.array([boundary_polygon.contains(Point(p, p)) for p in sub_pts])
+                if not np.any(valid_sub_mask):
+                    continue
                     
-                total_cut_vol += cut_v
-                total_fill_vol += fill_v
-                row_cells_data.append(f"{cell_str} ({actual_area:.1f}㎡)")
+                valid_sub_pts = sub_pts[valid_sub_mask]
+                sub_area = SUB_STEP * SUB_STEP
                 
-                cad_cells.append({
-                    'lines': grid_lines_to_draw,
-                    'cx': cx, 'cy': cy,
-                    'volume': -cut_v if cut_v > 0 else fill_v
+                def get_sub_z(pts_data, surface_cfg):
+                    if surface_cfg["type"] == "const":
+                        return np.full(len(valid_sub_pts), float(surface_cfg["value"]))
+                    z = griddata(pts_data[:, :2], pts_data[:, 2], valid_sub_pts, method='linear')
+                    nan_m = np.isnan(z)
+                    if np.any(nan_m):
+                        z[nan_m] = griddata(pts_data[:, :2], pts_data[:, 2], valid_sub_pts[nan_m], method='nearest')
+                    return z.astype(float)
+                    
+                z1_sub = get_sub_z(pts1, surface_1)
+                z2_sub = get_sub_z(pts2, surface_2)
+                
+                dz_sub = z2_sub - z1_sub
+                cell_volume = np.sum(dz_sub * sub_area)
+                cell_cut = abs(np.sum(dz_sub[dz_sub < 0] * sub_area))
+                cell_fill = np.sum(dz_sub[dz_sub > 0] * sub_area)
+                
+                total_cut_vol += cell_cut
+                total_fill_vol += cell_fill
+                
+                raw_cell_records.append({
+                    'row_idx': r_idx + 1,
+                    'col_idx': c_idx + 1,
+                    'cell_name': f"H{r_idx+1}-C{c_idx+1}",
+                    's1_g1': float(z1_corners[0]), 's1_g2': float(z1_corners[1]), 's1_g3': float(z1_corners[2]), 's1_g4': float(z1_corners[3]),
+                    's2_g1': float(z2_corners[0]), 's2_g2': float(z2_corners[1]), 's2_g3': float(z2_corners[2]), 's2_g4': float(z2_corners[3]),
+                    'area': float(actual_area),
+                    'cut': float(cell_cut),
+                    'fill': float(cell_fill)
                 })
                 
-            grid_rows_list.append(row_cells_data)
+                cx, cy = intersected_geo.centroid.x, intersected_geo.centroid.y
+                cad_cells.append({
+                    'lines': grid_lines_to_draw, 'cx': cx, 'cy': cy,
+                    'volume': -cell_cut if cell_volume < 0 else cell_fill
+                })
+                
+        if len(raw_cell_records) > 0:
+            df_base = pd.DataFrame(raw_cell_records)
+            excel_cols = [
+                "Tên ô lưới", 
+                "BM1-Góc 1 (Dưới-Trái)", "BM1-Góc 2 (Dưới-Phải)", "BM1-Góc 3 (Trên-Phải)", "BM1-Góc 4 (Trên-Trái)",
+                "BM2-Góc 1 (Dưới-Trái)", "BM2-Góc 2 (Dưới-Phải)", "BM2-Góc 3 (Trên-Phải)", "BM2-Góc 4 (Trên-Trái)", 
+                "Diện tích ô lưới (㎡)", "Khối lượng Đào (m³)", "Khối lượng Đắp (m³)"
+            ]
             
-        if len(grid_rows_list) > 0:
-            max_cols = max(len(r) for r in grid_rows_list)
-            df_cols = [f"Cột {c+1}" for c in range(max_cols)]
-            df_index = [f"Hàng {r+1}" for r in range(len(grid_rows_list))]
+            df_rows = df_base.sort_values(by=['row_idx', 'col_idx'])
+            st.session_state.df_by_rows = df_rows[[
+                'cell_name', 's1_g1', 's1_g2', 's1_g3', 's1_g4',
+                's2_g1', 's2_g2', 's2_g3', 's2_g4', 'area', 'cut', 'fill'
+            ]].copy()
+            st.session_state.df_by_rows.columns = excel_cols
             
-            st.session_state.df_result = pd.DataFrame(grid_rows_list, columns=df_cols, index=df_index).reset_index().rename(columns={'index': 'Hàng/Cột'})
+            df_cols_order = df_base.sort_values(by=['col_idx', 'row_idx'])
+            st.session_state.df_by_cols = df_cols_order[[
+                'cell_name', 's1_g1', 's1_g2', 's1_g3', 's1_g4',
+                's2_g1', 's2_g2', 's2_g3', 's2_g4', 'area', 'cut', 'fill'
+            ]].copy()
+            st.session_state.df_by_cols.columns = excel_cols
+            
             st.session_state.total_cut = total_cut_vol
             st.session_state.total_fill = total_fill_vol
             st.session_state.cad_grid_data = cad_cells
             st.session_state.calculated = True
-# --- HIỂN THỊ KẾT QUẢ VÙNG TRUNG TÂM (PERSISTENT RENDER) ---
-if st.session_state.calculated and st.session_state.df_result is not None:
-    st.success("🎉 Đã hoàn thành tính toán khối lượng đào đắp và cắt tỉa theo ranh giới chu vi tối ưu!")
+if st.session_state.calculated and st.session_state.df_by_rows is not None:
+    st.success("🎉 Tính toán thành công! Chu vi Bề mặt 1 và 2 cùng bản vẽ CAD đã được xuất lớp phân tầng.")
     
     col1, col2, col3 = st.columns(3)
     col1.metric("Tổng khối lượng ĐÀO 🟥", f"{st.session_state.total_cut:,.2f} m³")
@@ -258,61 +298,74 @@ if st.session_state.calculated and st.session_state.df_result is not None:
     net_diff = st.session_state.total_fill - st.session_state.total_cut
     col3.metric("Khối lượng cân bằng chênh lệch", f"{net_diff:,.2f} m³", delta_color="inverse")
 
-    st.subheader("📊 Bảng phân bố lưới ô vuông đã cắt tỉa")
-    st.dataframe(st.session_state.df_result, use_container_width=True)
+    tab1, tab2 = st.tabs(["📊 Khối kết quả sắp xếp theo HÀNG", "📊 Khối kết quả sắp xếp theo CỘT"])
+    with tab1:
+        st.dataframe(st.session_state.df_by_rows, use_container_width=True)
+    with tab2:
+        st.dataframe(st.session_state.df_by_cols, use_container_width=True)
     
-    st.subheader("💾 Tải về file thành phẩm tích hợp số liệu thực")
+    st.subheader("💾 Tải về tệp báo cáo công trường thành phẩm")
     dwn_col1, dwn_col2 = st.columns(2)
     
     output_excel = io.BytesIO()
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-        st.session_state.df_result.to_excel(writer, index=False, sheet_name="Khoi_Luong_Cat_Tia")
+        st.session_state.df_by_rows.to_excel(writer, index=False, sheet_name="Sap_Xep_Theo_Hang")
+        st.session_state.df_by_cols.to_excel(writer, index=False, sheet_name="Sap_Xep_Theo_Cot")
     excel_data = output_excel.getvalue()
     
     with dwn_col1:
         st.download_button(
-            label="📥 Tải xuống Bảng tính Excel (.xlsx)",
+            label="📥 Tải xuống Bảng tính Excel 12 cột (.xlsx)",
             data=excel_data,
-            file_name="khoi_luong_luoi_o_vuong.xlsx",
+            file_name="bao_cao_khoi_luong_12_cot.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
         
-    # --- XUẤT FILE CAD DXF KẾT HỢP BIÊN MÀU VÀNG CHUẨN KỸ THUẬT ---
+    # --- KHỞI TẠO XUẤT CAD DXF CHUYÊN NGHIỆP ---
     doc = ezdxf.new('R2010')
     msp = doc.modelspace()
 
-    doc.layers.new(name='SURFACE_1', dxfattribs={'color': 1})    
-    doc.layers.new(name='SURFACE_2', dxfattribs={'color': 3})    
+    doc.layers.new(name='SURFACE_1', dxfattribs={'color': 1})    # Đỏ (Mặc định cho điểm trắc địa tự nhiên)
+    doc.layers.new(name='SURFACE_2', dxfattribs={'color': 3})    # Xanh lá (Mặc định cho điểm thiết kế)
     doc.layers.new(name='GRID_LINES', dxfattribs={'color': 7})   
     doc.layers.new(name='BOUNDARY_CUSTOM', dxfattribs={'color': 2}) 
     doc.layers.new(name='EARTHWORK_CUT', dxfattribs={'color': 1}) 
     doc.layers.new(name='EARTHWORK_FILL', dxfattribs={'color': 3})
 
+    # Vẽ các điểm của Bề mặt 1
     if st.session_state.pts1_real is not None:
         for pt in st.session_state.pts1_real:
             x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
             msp.add_point((x, y, z), dxfattribs={'layer': 'SURFACE_1'})
             msp.add_text(text=f"{z:.2f}", dxfattribs={'layer': 'SURFACE_1', 'height': 0.3}).set_placement((x + 0.2, y, z))
 
+    # ĐÃ CẬP NHẬT: Vẽ đường chu vi ngoài Bề mặt 1 vào cùng Layer SURFACE_1, đặt Màu Xanh Dương ('color': 5)
+    if st.session_state.s1_hull_coords is not None:
+        msp.add_lwpolyline(
+            st.session_state.s1_hull_coords, 
+            dxfattribs={
+                'layer': 'SURFACE_1', 
+                'color': 5,            # Mã màu AutoCAD số 5 = Xanh Dương (Blue)
+                'const_width': 0.15
+            }
+        )
+
+    # Vẽ các điểm của Bề mặt 2
     if st.session_state.pts2_real is not None:
         for pt in st.session_state.pts2_real:
             x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
             msp.add_point((x, y, z), dxfattribs={'layer': 'SURFACE_2'})
             msp.add_text(text=f"{z:.2f}", dxfattribs={'layer': 'SURFACE_2', 'height': 0.3}).set_placement((x + 0.2, y, z))
 
+    # Vẽ đường ranh giới tính toán (Chu vi bề mặt 2 màu vàng hoặc ranh giới ngoài màu vàng)
     if st.session_state.boundary_poly_coords is not None:
         if st.session_state.boundary_source in ["surface2", "surfaces_intersect"]:
-            msp.add_lwpolyline(
-                st.session_state.boundary_poly_coords, 
-                dxfattribs={'layer': 'SURFACE_2', 'color': 2, 'const_width': 0.15}
-            )
+            msp.add_lwpolyline(st.session_state.boundary_poly_coords, dxfattribs={'layer': 'SURFACE_2', 'color': 2, 'const_width': 0.15})
         else:
-            msp.add_lwpolyline(
-                st.session_state.boundary_poly_coords, 
-                dxfattribs={'layer': 'BOUNDARY_CUSTOM', 'const_width': 0.15}
-            )
+            msp.add_lwpolyline(st.session_state.boundary_poly_coords, dxfattribs={'layer': 'BOUNDARY_CUSTOM', 'const_width': 0.15})
 
+    # Vẽ hệ lưới ô vuông đã cắt tỉa
     for cell in st.session_state.cad_grid_data:
         for poly_line in cell['lines']:
             for i in range(len(poly_line) - 1):
@@ -343,4 +396,4 @@ if st.session_state.calculated and st.session_state.df_result is not None:
             use_container_width=True
         )
 else:
-    st.info("💡 Hướng dẫn: Cấu hình các thông số bề mặt ở thanh điều hướng bên trái (Sidebar), sau đó nhấn nút 'Tiến hành tính toán khối lượng' để xem kết quả lưới ô vuông.")
+    st.info("💡 Hướng dẫn: Cấu hình dữ liệu đầu vào và ranh giới tại Sidebar bên trái, sau đó nhấn nút để nhận báo cáo số liệu bảo toàn và file vẽ lớp phân tầng.")
